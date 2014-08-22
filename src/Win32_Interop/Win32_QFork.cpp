@@ -20,11 +20,16 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "Win32_FDAPI.h"
+
 #include <Windows.h>
+#include <WinNT.h>
 #include <errno.h>
 #include <stdio.h>
 #include <wchar.h>
 #include <Psapi.h>
+#include <ShlObj.h>
+#include <Shlwapi.h>
 
 #define QFORK_MAIN_IMPL
 #include "Win32_QFork.h"
@@ -42,7 +47,13 @@
 #include <sstream>
 #include <stdint.h>
 #include <exception>
+#include <algorithm>
+#include <memory>
 using namespace std;
+
+#ifndef PAGE_REVERT_TO_FILE_MAP
+#define PAGE_REVERT_TO_FILE_MAP 0x80000000  // From Win8.1 SDK
+#endif
 
 const long long cSentinelHeapSize = 30 * 1024 * 1024;
 extern "C" int checkForSentinelMode(int argc, char **argv);
@@ -136,7 +147,7 @@ How the parent invokes the QFork process:
 
 const SIZE_T cAllocationGranularity = 1 << 18;                    // 256KB per heap block (matches large block allocation threshold of dlmalloc)
 const int cMaxBlocks = 1 << 24;                                   // 256KB * 16M heap blocks = 4TB. 4TB is the largest memory config Windows supports at present.
-const wchar_t* cMapFileBaseName = L"RedisQFork";
+const char* cMapFileBaseName = "RedisQFork";
 const int cDeadForkWait = 30000;
 size_t pageSize = 0;
 
@@ -172,6 +183,60 @@ HANDLE g_hQForkControlFileMap;
 HANDLE g_hForkedProcess;
 DWORD g_systemAllocationGranularity;
 int g_SlaveExitCode = 0; // For slave process
+
+bool ReportSpecialSystemErrors(int error) {
+    switch (error)
+    {
+        case ERROR_COMMITMENT_LIMIT:
+        {
+            ::redisLog(
+                REDIS_WARNING,
+                "\n"
+                "The Windows version of Redis allocates a memory mapped heap for sharing with\n"
+                "the forked process used for persistence operations. In order to share this\n"
+                "memory, Windows allocates from the system paging file a portion equal to the\n"
+                "size of the Redis heap. At this time there is insufficient contiguous free\n"
+                "space available in the system paging file for this operation (Windows error \n"
+                "0x5AF). To work around this you may either increase the size of the system\n"
+                "paging file, or decrease the size of the Redis heap with the --maxheap flag.\n"
+                "Sometimes a reboot will defragment the system paging file sufficiently for \n"
+                "this operation to complete successfully.\n"
+                "\n"
+                "Please see the documentation included with the binary distributions for more \n"
+                "details on the --maxheap flag.\n"
+                "\n"
+                "Redis can not continue. Exiting."
+                );
+            return true;
+        }
+
+        case ERROR_DISK_FULL:
+        {
+            ::redisLog(
+                REDIS_WARNING,
+                "\n"
+                "The Windows version of Redis allocates a large memory mapped file for sharing\n" 
+                "the heap with the forked process used in persistence operations. This file\n" 
+                "will be created in the current working directory or the directory specified by\n"
+                "the 'dir' directive in the .conf file. Windows is reporting that there is \n"
+                "insufficient disk space available for this file (Windows error 0x70).\n"
+                "\n" 
+                "You may fix this problem by either reducing the size of the Redis heap with\n"
+                "the --maxheap flag, or by starting redis from a working directory with\n"
+                "sufficient space available for the Redis heap. \n"
+                "\n"
+                "Please see the documentation included with the binary distributions for more \n"
+                "details on the --maxheap flag.\n"
+                "\n"
+                "Redis can not continue. Exiting."
+                );
+            return true;
+        }
+    
+        default:
+            return false;
+    }
+}
 
 BOOL QForkSlaveInit(HANDLE QForkConrolMemoryMapHandle, DWORD ParentProcessID) {
     try {
@@ -257,14 +322,16 @@ BOOL QForkSlaveInit(HANDLE QForkConrolMemoryMapHandle, DWORD ParentProcessID) {
         return TRUE;
     }
     catch(std::system_error syserr) {
-        ::redisLog(REDIS_WARNING, "QForkSlaveInit: system error caught. error code=0x%08x, message=%s\n", syserr.code().value(), syserr.what());
-        g_pQForkControl = NULL;
-        if(g_pQForkControl != NULL) {
-            if(g_pQForkControl->operationFailed != NULL) {
-                SetEvent(g_pQForkControl->operationFailed);
+        if (ReportSpecialSystemErrors(syserr.code().value()) == false) {
+            ::redisLog(REDIS_WARNING, "QForkSlaveInit: system error caught. error code=0x%08x, message=%s\n", syserr.code().value(), syserr.what());
+            g_pQForkControl = NULL;
+            if (g_pQForkControl != NULL) {
+                if (g_pQForkControl->operationFailed != NULL) {
+                    SetEvent(g_pQForkControl->operationFailed);
+                }
             }
+            return FALSE;
         }
-        return FALSE;
     }
     catch(std::runtime_error runerr) {
         ::redisLog(REDIS_WARNING, "QForkSlaveInit: runtime error caught. message=%s\n", runerr.what());
@@ -273,6 +340,59 @@ BOOL QForkSlaveInit(HANDLE QForkConrolMemoryMapHandle, DWORD ParentProcessID) {
         return FALSE;
     }
     return FALSE;
+}
+
+string GetLocalAppDataFolder() {
+    char localAppDataPath[_MAX_PATH];
+    HRESULT hr;
+    if (S_OK != (hr = SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, SHGFP_TYPE_CURRENT, localAppDataPath))) {
+        throw std::system_error(hr, system_category(), "SHGetFolderPathA failed");
+    }
+    char redisAppDataPath[_MAX_PATH];
+    if (NULL == PathCombineA(redisAppDataPath, localAppDataPath, "Redis")) {
+        throw std::system_error(hr, system_category(), "PathCombineA failed");
+    }
+
+    if (PathIsDirectoryA(redisAppDataPath) == FALSE) {
+        if (CreateDirectoryA(redisAppDataPath, NULL) == FALSE) {
+            throw std::system_error(hr, system_category(), "CreateDirectoryA failed");
+        }
+    }
+
+    return redisAppDataPath;
+}
+
+string g_MMFDir;
+string GetWorkingDirectory() {
+    if (g_MMFDir.length() == 0) {
+        string workingDir;
+        if (g_argMap.find(cHeapDir) != g_argMap.end()) {
+            workingDir = g_argMap[cHeapDir][0][0];
+            std::replace(workingDir.begin(), workingDir.end(), '/', '\\');
+
+            if (PathIsRelativeA(workingDir.c_str())) {
+                char cwd[MAX_PATH];
+                if (0 == ::GetCurrentDirectoryA(MAX_PATH, cwd)) {
+                    throw std::system_error(GetLastError(), system_category(), "GetCurrentDirectoryA failed");
+                }
+                char fullPath[_MAX_PATH];
+                if (NULL == PathCombineA(fullPath, cwd, workingDir.c_str())) {
+                    throw std::system_error(GetLastError(), system_category(), "PathCombineA failed");
+                }
+                workingDir = fullPath;
+            }
+        } else {
+            workingDir = GetLocalAppDataFolder();
+        }
+
+        if (workingDir.at(workingDir.length() - 1) != '\\') {
+            workingDir = workingDir.append("\\");
+        }
+
+        g_MMFDir = workingDir;
+    }
+
+    return g_MMFDir;
 }
 
 BOOL QForkMasterInit( __int64 maxheapBytes ) {
@@ -325,34 +445,38 @@ BOOL QForkMasterInit( __int64 maxheapBytes ) {
 
         // FILE_FLAG_DELETE_ON_CLOSE will not clean up files in the case of a BSOD or power failure.
         // Clean up anything we can to prevent excessive disk usage.
-        wchar_t heapMemoryMapWildCard[MAX_PATH];
-        WIN32_FIND_DATA fd;
-        swprintf_s(
+        char heapMemoryMapWildCard[MAX_PATH];
+        WIN32_FIND_DATAA fd;
+        sprintf_s(
             heapMemoryMapWildCard,
             MAX_PATH,
-            L"%s_*.dat",
+            "%s%s_*.dat",
+            GetWorkingDirectory().c_str(),
             cMapFileBaseName);
-        HANDLE hFind = FindFirstFile(heapMemoryMapWildCard, &fd);
+        HANDLE hFind = FindFirstFileA(heapMemoryMapWildCard, &fd);
         while (hFind != INVALID_HANDLE_VALUE) {
             // Failure likely means the file is in use by another redis instance.
-            DeleteFile(fd.cFileName);
+            DeleteFileA(fd.cFileName);
 
-            if (FALSE == FindNextFile(hFind, &fd)) {
+            if (FALSE == FindNextFileA(hFind, &fd)) {
                 FindClose(hFind);
                 hFind = INVALID_HANDLE_VALUE;
             }
         }
 
-        wchar_t heapMemoryMapPath[MAX_PATH];
-        swprintf_s( 
-            heapMemoryMapPath, 
-            MAX_PATH, 
-            L"%s_%d.dat", 
+        string workingDir = GetWorkingDirectory();
+
+        char heapMemoryMapPath[MAX_PATH];
+        sprintf_s(
+            heapMemoryMapPath,
+            MAX_PATH,
+            "%s%s_%d.dat",
+            workingDir.c_str(),
             cMapFileBaseName, 
             GetCurrentProcessId());
 
         g_pQForkControl->heapMemoryMapFile = 
-            CreateFileW( 
+            CreateFileA( 
                 heapMemoryMapPath,
                 GENERIC_READ | GENERIC_WRITE,
                 0,
@@ -475,7 +599,9 @@ BOOL QForkMasterInit( __int64 maxheapBytes ) {
         return TRUE;
     }
     catch(std::system_error syserr) {
-        ::redisLog(REDIS_WARNING, "QForkMasterInit: system error caught. error code=0x%08x, message=%s\n", syserr.code().value(), syserr.what());
+        if (ReportSpecialSystemErrors(syserr.code().value()) == false) {
+            ::redisLog(REDIS_WARNING, "QForkMasterInit: system error caught. error code=0x%08x, message=%s\n", syserr.code().value(), syserr.what());
+        }
     }
     catch(std::runtime_error runerr) {
         ::redisLog(REDIS_WARNING, "QForkMasterInit: runtime error caught. message=%s\n", runerr.what());
@@ -774,7 +900,7 @@ BOOL BeginForkOperation(OperationType type, char* fileName, LPVOID globalData, i
         char arguments[_MAX_PATH];
         memset(arguments,0,_MAX_PATH);
         PROCESS_INFORMATION pi;
-        sprintf_s(arguments, _MAX_PATH, "%s --%s %llu %lu", fileName, cQFork.c_str(), (uint64_t)g_hQForkControlFileMap, GetCurrentProcessId());
+        sprintf_s(arguments, _MAX_PATH, "\"%s\" --%s %llu %lu", fileName, cQFork.c_str(), (uint64_t)g_hQForkControlFileMap, GetCurrentProcessId());
         if (FALSE == CreateProcessA(fileName, arguments, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
             throw system_error( 
                 GetLastError(),
@@ -856,6 +982,84 @@ BOOL AbortForkOperation()
     return FALSE;
 }
 
+void RejoinCOWPages(HANDLE mmHandle, byte* mmStart, size_t mmSize) {
+    SmartFileView<byte> copyView(
+        mmHandle,
+        FILE_MAP_WRITE,
+        0,
+        0,
+        mmSize,
+        string("RejoinCOWPages: Could not map COW back-copy view."));
+    HANDLE hProcess = GetCurrentProcess();
+    int pages = (int)(mmSize / pageSize);
+    shared_ptr<PSAPI_WORKING_SET_EX_INFORMATION> pwsi(
+        new PSAPI_WORKING_SET_EX_INFORMATION[pages],
+        [](PSAPI_WORKING_SET_EX_INFORMATION *p) { delete[] p; });
+    if (pwsi == NULL) {
+        throw new system_error(
+            GetLastError(),
+            system_category(),
+            "pwsi == NULL");
+    }
+    memset(pwsi.get(), 0, sizeof(PSAPI_WORKING_SET_EX_INFORMATION)* pages);
+    int virtualLockFailures = 0;
+    for (int page = 0; page < pages; page++) {
+        pwsi.get()[page].VirtualAddress = mmStart + page * pageSize;
+    }
+
+    if (QueryWorkingSetEx(
+        hProcess,
+        pwsi.get(),
+        sizeof(PSAPI_WORKING_SET_EX_INFORMATION)* pages) == FALSE) {
+        throw system_error(
+            GetLastError(),
+            system_category(),
+            "RejoinCOWPages: QueryWorkingSet failure");
+    }
+
+    for (int page = 0; page < pages; page++) {
+        if (pwsi.get()[page].VirtualAttributes.Valid == 1) {
+            // A 0 share count indicates a COW page
+            if (pwsi.get()[page].VirtualAttributes.ShareCount == 0) {
+                memcpy(copyView + (page*pageSize), mmStart + (page*pageSize), pageSize);
+            }
+        }
+    }
+
+    // If the COWs are not discarded, then there is no way of propagating changes into subsequent fork operations. 
+    if (IsWindowsVersionAtLeast(8, 0, 0)) {
+        // restores all page protections on the view and culls the COW pages.
+        DWORD oldProtect;
+        if (FALSE == VirtualProtect(mmStart, pages * pageSize, PAGE_READWRITE | PAGE_REVERT_TO_FILE_MAP, &oldProtect)) {
+            throw std::system_error(GetLastError(), std::system_category(), "RejoinCOWPages: COW cull failed");
+        }
+    } else {
+        // Prior to Win8 unmapping the view was the only way to discard the COW pages from the view. Unfortunately this forces
+        // the view to be completely flushed to disk, which is a bit inefficient.
+        if (UnmapViewOfFile(mmStart) == FALSE) {
+            throw std::system_error(
+                GetLastError(),
+                system_category(),
+                "RejoinCOWPages: UnmapViewOfFile failed.");
+        }
+        // There is a race condition here. Something could map into the virtual address space used by the heap at the moment 
+        // we are discarding local changes. There is nothing to do but report the problem and exit. This problem does not 
+        // exist with the code above in Win8+ as the view is never unmapped.
+        LPVOID remapped =
+            MapViewOfFileEx(
+            mmHandle,
+            FILE_MAP_ALL_ACCESS,
+            0, 0,
+            0,
+            mmStart);
+        if (remapped == NULL) {
+            throw std::system_error(
+                GetLastError(),
+                system_category(),
+                "RejoinCOWPages: MapViewOfFileEx failed. Please upgrade your OS to Win8 or newer.");
+        }
+    }
+}
 
 BOOL EndForkOperation(int * pExitCode) {
     try {
@@ -910,154 +1114,16 @@ BOOL EndForkOperation(int * pExitCode) {
                 "EndForkOperation: ResetEvent() failed.");
         }
 
-        // restore protection constants on shared memory blocks 
-        DWORD oldProtect = 0;
-        if (VirtualProtect(g_pQForkControl, sizeof(QForkControl), PAGE_READWRITE, &oldProtect) == FALSE) {
-            throw std::system_error(
-                GetLastError(), 
-                system_category(),
-                "EndForkOperation: VirtualProtect failed.");
-        }
-        if (VirtualProtect( 
-            g_pQForkControl->heapStart, 
-            g_pQForkControl->availableBlocksInHeap * g_pQForkControl->heapBlockSize, 
-            PAGE_READWRITE, 
-            &oldProtect) == FALSE ) {
-            throw std::system_error(
-                GetLastError(),
-                system_category(),
-                "EndForkOperation: VirtualProtect failed.");
-        }
+        // move local changes back into memory mapped views for next fork operation
+        RejoinCOWPages(
+            g_pQForkControl->heapMemoryMap,
+            (byte*)g_pQForkControl->heapStart,
+            g_pQForkControl->availableBlocksInHeap * cAllocationGranularity);
 
-        //
-        // What can be done to unify COW pages back into the section?
-        //
-        // 1. find the modified pages
-        // 2. copy the modified pages into a buffer
-        // 3. close the section map (discarding local changes)
-        // 4. reopen the section map
-        // 5. copy modified pages over reopened section map
-        //
-        // This assumes that the forked process is reasonably quick, such that this copy is not a huge burden.
-        //
-        typedef vector<INT_PTR> COWList;
-        typedef COWList::iterator COWListIterator;
-        COWList cowList;
-        HANDLE hProcess = GetCurrentProcess();
-        size_t mmSize = g_pQForkControl->availableBlocksInHeap * g_pQForkControl->heapBlockSize;
-        int pages = (int)(mmSize / pageSize);
-        PSAPI_WORKING_SET_EX_INFORMATION* pwsi =
-            new PSAPI_WORKING_SET_EX_INFORMATION[pages];
-        if (pwsi == NULL) {
-            throw new system_error(
-                GetLastError(),
-                system_category(),
-                "pwsi == NULL");
-        }
-        memset(pwsi, 0, sizeof(PSAPI_WORKING_SET_EX_INFORMATION) * pages);
-        int virtualLockFailures = 0;
-        for (int page = 0; page < pages; page++) {
-            pwsi[page].VirtualAddress = (BYTE*)g_pQForkControl->heapStart + page * pageSize;
-        }
-                
-        if (QueryWorkingSetEx( 
-                hProcess, 
-                pwsi, 
-                sizeof(PSAPI_WORKING_SET_EX_INFORMATION) * pages) == FALSE) {
-            throw system_error( 
-                GetLastError(),
-                system_category(),
-                "QueryWorkingSet failure");
-        }
-
-        for (int page = 0; page < pages; page++) {
-            if (pwsi[page].VirtualAttributes.Valid == 1) {
-                // A 0 share count indicates a COW page
-                if (pwsi[page].VirtualAttributes.ShareCount == 0) {
-                    cowList.push_back(page);
-                }
-            }
-        }
-
-        if (cowList.size() > 0) {
-            LPBYTE cowBuffer = (LPBYTE)malloc(cowList.size() * pageSize);
-            int bufPageIndex = 0;
-            for (COWListIterator cli = cowList.begin(); cli != cowList.end(); cli++) {
-                memcpy(
-                    cowBuffer + (bufPageIndex * pageSize),
-                    (BYTE*)g_pQForkControl->heapStart + ((*cli) * pageSize),
-                    pageSize);
-                bufPageIndex++;
-            }
-
-            delete [] pwsi;
-            pwsi = NULL;
-
-            // discard local changes
-            if (UnmapViewOfFile(g_pQForkControl->heapStart) == FALSE) {
-                throw std::system_error(
-                    GetLastError(),
-                    system_category(),
-                    "EndForkOperation: UnmapViewOfFile failed.");
-            }
-            g_pQForkControl->heapStart = 
-                MapViewOfFileEx(
-                    g_pQForkControl->heapMemoryMap,
-                    FILE_MAP_ALL_ACCESS,
-                    0,0,                            
-                    0,  
-                    g_pQForkControl->heapStart);
-            if (g_pQForkControl->heapStart == NULL) {
-                throw std::system_error(
-                    GetLastError(),
-                    system_category(),
-                    "EndForkOperation: Remapping ForkControl block failed.");
-            }
-
-            // copied back local changes to remapped view
-            bufPageIndex = 0;
-            for (COWListIterator cli = cowList.begin(); cli != cowList.end(); cli++) {
-                memcpy(
-                    (BYTE*)g_pQForkControl->heapStart + ((*cli) * pageSize),
-                    cowBuffer + (bufPageIndex * pageSize),
-                    pageSize);
-                bufPageIndex++;
-            }
-            delete cowBuffer;
-            cowBuffer = NULL;
-        }
-
-        // now do the same with qfork control
-        LPVOID controlCopy = malloc(sizeof(QForkControl));
-        if(controlCopy == NULL) {
-            throw std::system_error(
-                GetLastError(),
-                system_category(),
-                "EndForkOperation: allocation failed.");
-        }
-        memcpy(controlCopy, g_pQForkControl, sizeof(QForkControl));
-        if (UnmapViewOfFile(g_pQForkControl) == FALSE) {
-            throw std::system_error(
-                GetLastError(),
-                system_category(),
-                "EndForkOperation: UnmapViewOfFile failed.");
-        }
-        g_pQForkControl = (QForkControl*)
-            MapViewOfFileEx(
-                g_hQForkControlFileMap,
-                FILE_MAP_ALL_ACCESS,
-                0,0,                            
-                0,  
-                g_pQForkControl);
-        if (g_pQForkControl == NULL) {
-            throw std::system_error(
-                GetLastError(), 
-                system_category(), 
-                "EndForkOperation: Remapping ForkControl failed.");
-        }
-        memcpy(g_pQForkControl, controlCopy,sizeof(QForkControl));
-        delete controlCopy;
-        controlCopy = NULL;
+        RejoinCOWPages(
+            g_hQForkControlFileMap,
+            (byte*)g_pQForkControl,
+            sizeof(QForkControl));
 
         return TRUE;
     }

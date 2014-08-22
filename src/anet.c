@@ -49,6 +49,7 @@
 #ifdef _WIN32
 #include "win32_Interop/win32fixes.h"
 #define ANET_NOTUSED(V) V
+#include <Mstcpip.h>
 #endif
 
 #include "anet.h"
@@ -81,20 +82,34 @@ int anetNonBlock(char *err, int fd)
     return ANET_OK;
 }
 
-/* Set TCP keep alive option to detect dead peers. The interval option
- * is only used for Linux as we are using Linux-specific APIs to set
- * the probe send time, interval, and count. */
-int anetKeepAlive(char *err, int fd, int interval)
-{
+/* Set TCP keep alive option to detect dead peers. */
+int anetKeepAlive(char *err, int fd, int interval) {
+#ifdef _WIN32    
     int val = 1;
 
-    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val)) == -1)
-    {
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val)) == -1) {
         anetSetError(err, "setsockopt SO_KEEPALIVE: %s", strerror(errno));
         return ANET_ERR;
     }
 
-#ifdef __linux__
+    struct tcp_keepalive alive; 
+    DWORD dwBytesRet = 0; 
+    alive.onoff = TRUE; 
+    alive.keepalivetime = interval * 1000; 
+    /* According to http://msdn.microsoft.com/en-us/library/windows/desktop/ee470551(v=vs.85).aspx 
+       On Windows Vista and later, the number of keep-alive probes (data retransmissions) is set to 10 and cannot be changed. 
+        So we set the keep alive interval as interval/10, as 10 probes will be send before 
+        detecting an error 
+    */ 
+    val = interval/10; 
+    if (val == 0) val = 1; 
+    alive.keepaliveinterval = val*1000; 
+    if(WSAIoctl(fd, SIO_KEEPALIVE_VALS, &alive, sizeof(alive), 
+       NULL, 0, &dwBytesRet, NULL, NULL) == SOCKET_ERROR) { 
+        anetSetError(err, "WSAIotcl(SIO_KEEPALIVE_VALS) failed with error code %d\n", WSAGetLastError()); 
+    	return ANET_ERR; 
+    } 
+#else
     /* Default settings are more or less garbage, with the keepalive time
      * set to 7200 by default on Linux. Modify settings to make the feature
      * actually useful. */
@@ -260,31 +275,14 @@ static int anetCreateSocket(char *err, int domain) {
 #define ANET_CONNECT_NONBLOCK 1
 static int anetTcpGenericConnect(char *err, char *addr, int port, int flags) {
     int rfd;
-    struct sockaddr_in sa;
-    unsigned long inAddress;
+    SOCKADDR_STORAGE ss;
 
-    if ((rfd = anetCreateSocket(err,AF_INET)) == ANET_ERR) {
+    ParseStorageAddress(addr, port, &ss);
+
+    if ((rfd = anetCreateSocket(err,ss.ss_family)) == ANET_ERR) {
         return ANET_ERR;
     }
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((u_short)port);
-    inAddress = inet_addr(addr);
-    if (inAddress == INADDR_NONE || inAddress == INADDR_ANY) {
-        struct hostent *he;
-
-        he = gethostbyname(addr);
-        if (he == NULL) {
-            anetSetError(err, "can't resolve: %s\n", addr);
-            close(rfd);
-            return ANET_ERR;
-        }
-        memcpy(&sa.sin_addr, he->h_addr, sizeof(struct in_addr));
-    }
-    else {
-      sa.sin_addr.s_addr = inAddress;
-    }
-
-    if (aeWinSocketConnect(rfd, (struct sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR) {
+    if (aeWinSocketConnect(rfd, &ss ) == SOCKET_ERROR) {
         if ((errno == WSAEWOULDBLOCK || errno == WSA_IO_PENDING)) errno = EINPROGRESS;
         if (errno == EINPROGRESS && flags & ANET_CONNECT_NONBLOCK) {
             return rfd;
@@ -507,7 +505,7 @@ static int _anetTcpServer(char *err, int port, char *bindaddr, int af, int backl
 #else
         if (anetSetReuseAddr(err,s) == ANET_ERR) goto error;
 #endif
-        if (anetListen(err,s,p->ai_addr,p->ai_addrlen,backlog) == ANET_ERR) goto error;
+        if (anetListen(err,s,p->ai_addr,(socklen_t)p->ai_addrlen,backlog) == ANET_ERR) goto error;
         goto end;
     }
     if (p == NULL) {
@@ -582,7 +580,7 @@ int anetTcpAccept(char *err, int s, char *ip, size_t ip_len, int *port) {
     int fd;
     struct sockaddr_storage sa;
     socklen_t salen = sizeof(sa);
-    if ((fd = anetGenericAccept(err,s,(struct sockaddr*)&sa,&salen)) == ANET_ERR)
+    if ((fd = anetGenericAccept(err,s,(struct sockaddr*)&sa,&salen)) == -1)
         return ANET_ERR;
 
     if (sa.ss_family == AF_INET) {
@@ -606,7 +604,7 @@ int anetUnixAccept(char *err, int s) {
     int fd;
     struct sockaddr_un sa;
     socklen_t salen = sizeof(sa);
-    if ((fd = anetGenericAccept(err,s,(struct sockaddr*)&sa,&salen)) == ANET_ERR)
+    if ((fd = anetGenericAccept(err,s,(struct sockaddr*)&sa,&salen)) == -1)
         return ANET_ERR;
 
     return fd;
